@@ -6,6 +6,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -397,14 +399,18 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
+    struct tensor_snapshot {
+        static constexpr size_t size = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
+
+        std::array<char, size> data;
+        uint64_t               buffer_uid = 0;
+    };
+
     std::vector<ggml_context_ptr> ctxs;
     std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
-    // Snapshots of the source tensor structs, used by persistent single-owner
-    // containers (scratch pools) to treat entries left behind at recycled
-    // arena addresses as misses.
-    static constexpr size_t identity_size = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<const ggml_tensor *, std::array<char, identity_size>> identities;
-    bool validate_identity = false;
+    // Scratch pools persist across arena reuse. Match tensor metadata and buffer lifetime before reusing a shard.
+    std::map<const ggml_tensor *, tensor_snapshot> snapshots;
+    bool validate_snapshot = false;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -416,15 +422,11 @@ struct ggml_backend_meta_simple_tensor_container {
 };
 
 struct ggml_backend_meta_buffer_context {
-    // The buffer context only owns the shard registrations of its statically
-    // allocated tensors. Registrations for compute tensors and external views
-    // are owned by the meta backend instance executing the graph and share the
-    // lifetime of its cached subgraphs — buffers can be shared by multiple
-    // backend instances (e.g. MTP assistant models sharing the target's KV
-    // cache), so a buffer-global container would let one instance's rebuild
-    // destroy views another instance still references.
+    // Compute registrations belong to the backend because buffers can be shared across model contexts.
     ggml_backend_meta_simple_tensor_container stc_static;
     std::vector<ggml_backend_buffer_ptr> bufs;
+
+    const uint64_t uid;
 
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
@@ -437,13 +439,20 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)) {
+            : stc_static(std::move(stc_static)), uid(next_uid()) {
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
         }
         const char * GGML_META_DEBUG = getenv("GGML_META_DEBUG");
         debug = GGML_META_DEBUG ? atoi(GGML_META_DEBUG) : 0;
+    }
+
+    static uint64_t next_uid() {
+        static std::atomic<uint64_t> counter { 0 };
+        const uint64_t uid = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        GGML_ASSERT(uid != 0);
+        return uid;
     }
 
 };
@@ -482,8 +491,7 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
 
-// Resolve the per-device shard of `tensor`: static registrations first, then
-// the owner's container, creating the registration there on demand.
+// Resolve a static shard first, then create an owner-local shard on demand.
 static struct ggml_tensor * ggml_backend_meta_simple_tensor_ensure(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, size_t index) {
     ggml_tensor * tensor_nc = const_cast<ggml_tensor *>(tensor);
@@ -491,12 +499,12 @@ static struct ggml_tensor * ggml_backend_meta_simple_tensor_ensure(
     if (ret != nullptr) {
         return ret;
     }
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     auto it = stc.simple_tensors.find(tensor);
-    if (it != stc.simple_tensors.end() && stc.validate_identity) {
-        auto id_it = stc.identities.find(tensor);
-        if (id_it == stc.identities.end() ||
-                memcmp(id_it->second.data(), (const char *) tensor, id_it->second.size()) != 0) {
-            // recycled address: a different tensor now lives here
+    if (it != stc.simple_tensors.end() && stc.validate_snapshot) {
+        auto snapshot_it = stc.snapshots.find(tensor);
+        if (snapshot_it == stc.snapshots.end() || snapshot_it->second.buffer_uid != buf_ctx->uid ||
+                memcmp(snapshot_it->second.data.data(), (const char *) tensor, snapshot_it->second.data.size()) != 0) {
             stc.simple_tensors.erase(it);
             it = stc.simple_tensors.end();
         }
@@ -505,22 +513,20 @@ static struct ggml_tensor * ggml_backend_meta_simple_tensor_ensure(
         ggml_backend_meta_buffer_init_tensor_impl(stc, tensor_nc);
         it = stc.simple_tensors.find(tensor);
         GGML_ASSERT(it != stc.simple_tensors.end());
-        if (stc.validate_identity) {
-            auto & id = stc.identities[tensor];
-            memcpy(id.data(), (const char *) tensor, id.size());
+        if (stc.validate_snapshot) {
+            auto & snapshot = stc.snapshots[tensor];
+            memcpy(snapshot.data.data(), (const char *) tensor, snapshot.data.size());
+            snapshot.buffer_uid = buf_ctx->uid;
         }
     }
     return it->second[index];
 }
 
-// Scratch shards for graph-external accesses, which have no owner identity at
-// the buffer interface. The pools persist per thread and entries are identity-
-// validated, since these accesses mostly target the same structs every call.
+// Graph-external accesses use persistent per-thread shards because the buffer interface has no owner identity.
 struct ggml_backend_meta_scratch_shards {
     ggml_backend_meta_simple_tensor_container & stc;
 
     explicit ggml_backend_meta_scratch_shards(size_t n_bufs) : stc(acquire(n_bufs)) {
-        // compact only when the struct arena nears capacity
         bool needs_compact = false;
         for (ggml_context_ptr & c : stc.ctxs) {
             if (ggml_used_mem(c.get()) > 3*ggml_get_mem_size(c.get())/4) {
@@ -533,12 +539,9 @@ struct ggml_backend_meta_scratch_shards {
                 ggml_reset(c.get());
             }
             stc.simple_tensors.clear();
-            stc.identities.clear();
+            stc.snapshots.clear();
         }
     }
-
-
-    // reusable thread-local pools
     static ggml_backend_meta_simple_tensor_container & acquire(size_t n_bufs) {
         static thread_local std::map<size_t, ggml_backend_meta_simple_tensor_container> registry;
         auto it = registry.find(n_bufs);
@@ -549,7 +552,7 @@ struct ggml_backend_meta_scratch_shards {
                 /*.no_alloc   =*/ true,
             };
             it = registry.emplace(n_bufs, ggml_backend_meta_simple_tensor_container(params, (int) n_bufs)).first;
-            it->second.validate_identity = true;
+            it->second.validate_snapshot = true;
         }
         return it->second;
     }
